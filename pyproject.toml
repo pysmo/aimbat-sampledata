@@ -8,8 +8,44 @@ dependencies = [
     "pandas>=2.0",
 ]
 
+[dependency-groups]
+dev = [
+    "mypy>=1.14",
+    "pytest>=8.4.2",
+    "ruff>=0.13.0",
+]
+
 [tool.uv]
 package = false
 
 [tool.uv.sources]
-pysmo = { path = "../pysmo", editable = true }
+pysmo = { git = "https://github.com/pysmo/pysmo", rev = "d3322c9b605ceea3081ac942b73f987998c5d139" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.mypy]
+disallow_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.ruff]
+extend-exclude = ["Event_*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+section-order = [
+    "future",
+    "standard-library",
+    "third-party",
+    "pysmo-group",
+    "first-party",
+    "local-folder",
+]
+
+[tool.ruff.lint.isort.sections]
+"pysmo-group" = ["pysmo"]

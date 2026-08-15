@@ -58,10 +58,10 @@ class EventSpec:
 
 EVENTS = [
     EventSpec("komandorskiye_ostrova", "us20009x42"),
-    EventSpec("kumamoto_japan", "us20005iis"),
-    EventSpec("pinotepa_mexico", "us2000d3km"),
     EventSpec("fiji_region", "usc000stdc"),
-    EventSpec("papua_new_guinea", "us10007uph"),
+    EventSpec("nepal", "us20002926"),
+    EventSpec("iraq", "us2000bmcg"),
+    EventSpec("solomon_islands", "usc000phx5"),
 ]
 
 
@@ -165,20 +165,42 @@ def _select_subset(stations: list[MiniStation], count: int) -> list[MiniStation]
     return [ordered[i] for i in unique_indices]
 
 
-def _fetch_one_event(spec: EventSpec, count: int = STATIONS_PER_EVENT) -> None:
-    event = _fetch_event(spec.usgs_eventid)
+def _select_common_stations(
+    events: list[MiniEvent], count: int = STATIONS_PER_EVENT
+) -> list[MiniStation]:
+    """Pick one station set shared by every given event, not one per event.
+
+    Selecting independently per event (each against its own differently
+    shaped pool) barely overlaps station-to-station even when the same
+    physical station is available for both — the linspace lands on
+    different indices. Multiple events per station is valuable for this
+    test dataset (ICCS/MCCC exercise the same station across events), so
+    intersect first and spread by latitude once.
+    """
+    pools = [
+        {f"{s.network}.{s.name}": s for s in _discover_stations(event.time)}
+        for event in events
+    ]
+    common_keys = set.intersection(*(set(pool) for pool in pools))
+    candidates = [
+        station
+        for key in common_keys
+        for station in [next(pool[key] for pool in pools if key in pool)]
+        if all(haversine(event, station) < MAX_P_DISTANCE_DEG for event in events)
+    ]
+    return _select_subset(candidates, count)
+
+
+def _fetch_one_event(
+    spec: EventSpec, event: MiniEvent, stations: list[MiniStation]
+) -> None:
     event_dir = OUTPUT_DIR / (
-        f"Event_{event.time:%Y.%m.%d.%H.%M.%S}."
-        f"{event.time.microsecond // 1000:03d}"
+        f"Event_{event.time:%Y.%m.%d.%H.%M.%S}.{event.time.microsecond // 1000:03d}"
     )
     event_dir.mkdir(exist_ok=True)
 
-    pool = _discover_stations(event.time)
-    pool = [s for s in pool if haversine(event, s) < MAX_P_DISTANCE_DEG]
-    selected = _select_subset(pool, count)
-
     manifest_rows: list[dict[str, object]] = []
-    for station in selected:
+    for station in stations:
         dist_deg = haversine(event, station)
         try:
             travel_times = fetch_travel_times(event.depth / 1000.0, dist_deg, ["P"])
@@ -186,6 +208,13 @@ def _fetch_one_event(spec: EventSpec, count: int = STATIONS_PER_EVENT) -> None:
             starttime = predicted_p - MARGIN_BEFORE
             endtime = predicted_p + DURATION_AFTER
             sac = SAC.fetch(station=station, starttime=starttime, endtime=endtime)
+            # dataselect can return a short prefix instead of erroring outright
+            # when the station has a data gap partway through the window.
+            if sac.seismogram.end_time < endtime - pd.Timedelta(seconds=1):
+                raise RuntimeError(
+                    f"incomplete data: got {sac.seismogram.begin_time} to "
+                    f"{sac.seismogram.end_time}, requested up to {endtime}"
+                )
             idep = _deconvolve(sac, station)
         except Exception as exc:  # noqa: BLE001 - skip and log, don't abort the run
             print(f"skip {station.network}.{station.name}: {exc}")
@@ -198,6 +227,7 @@ def _fetch_one_event(spec: EventSpec, count: int = STATIONS_PER_EVENT) -> None:
         sac.event.longitude = event.longitude
         sac.event.depth = event.depth
         sac.event.time = event.time
+        assert sac.native.o is not None  # populated as soon as event.time is set
 
         sac.timestamps.t0 = predicted_p  # initial pick, for ICCS-style workflows
 
@@ -228,12 +258,15 @@ def _fetch_one_event(spec: EventSpec, count: int = STATIONS_PER_EVENT) -> None:
         writer = csv.DictWriter(fh, fieldnames=list(manifest_rows[0].keys()))
         writer.writeheader()
         writer.writerows(manifest_rows)
-    print(f"{spec.label}: {len(manifest_rows)}/{len(selected)} stations fetched")
+    print(f"{spec.label}: {len(manifest_rows)}/{len(stations)} stations fetched")
 
 
 def main() -> None:
-    for spec in EVENTS:
-        _fetch_one_event(spec)
+    fetched = [(spec, _fetch_event(spec.usgs_eventid)) for spec in EVENTS]
+
+    shared_stations = _select_common_stations([event for _, event in fetched])
+    for spec, event in fetched:
+        _fetch_one_event(spec, event, shared_stations)
 
 
 if __name__ == "__main__":
