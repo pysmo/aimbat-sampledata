@@ -1,5 +1,5 @@
 [project]
-name = "data-example"
+name = "aimbat-sampledata"
 version = "0.1.0"
 description = "Fetch script and provenance for pysmo/AIMBAT's example seismic dataset"
 requires-python = ">=3.12,<3.15"
