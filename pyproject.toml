@@ -2,7 +2,7 @@
 name = "aimbat-sampledata"
 version = "0.1.0"
 description = "Fetch script and provenance for pysmo/AIMBAT's example seismic dataset"
-requires-python = ">=3.12,<3.15"
+requires-python = ">=3.13,<3.15"
 dependencies = [
     "pysmo",
     "pandas>=2.0",
@@ -11,6 +11,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "mypy>=1.14",
+    "pandas-stubs>=2.0",
     "pytest>=8.4.2",
     "ruff>=0.13.0",
 ]
@@ -19,7 +20,7 @@ dev = [
 package = false
 
 [tool.uv.sources]
-pysmo = { git = "https://github.com/pysmo/pysmo", rev = "d3322c9b605ceea3081ac942b73f987998c5d139" }
+pysmo = { git = "https://github.com/pysmo/pysmo", rev = "ddc1379f8fac4f7a17d1fe45851d085873f63361" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

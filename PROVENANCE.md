@@ -87,8 +87,9 @@ event while succeeding for another.
 ## Window formula
 
 For each surviving station: `dist_deg = haversine(event, station)`,
-`travel_times = fetch_travel_times(depth_km, dist_deg, ["P"])`,
-`predicted_p = origin_time + travel_times["P"]`.
+`arrivals = travel_times(depth=depth_m, distance=dist_deg, phases=["P"])`,
+`predicted_p = origin_time + arrivals["P"]`. The P arrival is computed
+locally (Buland–Chapman tau-p, iasp91), not fetched from a web service.
 
 - **Start** = `predicted_p − 2min`
 - **End** = `predicted_p + 3min`
@@ -152,7 +153,7 @@ uv run python fetch_events.py
 
 `pyproject.toml` pins `pysmo` to a specific commit via `[tool.uv.sources]`
 (`git = "https://github.com/pysmo/pysmo", rev = "<sha>"`), since
-`fetch_sac`/`fetch_travel_times`/`SAC.fetch` aren't yet in a tagged
+`fetch_sac`/`SAC.fetch`/`travel_times` aren't yet in a tagged
 release. When iterating on a local `pysmo` checkout, override transiently
 with `{ path = "../pysmo", editable = true }` — swap back to the git+rev
 pin before committing, since the path form has no meaning in CI (a fresh
