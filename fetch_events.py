@@ -30,7 +30,8 @@ from pysmo.lib.io import (
 )
 from pysmo.tools.azdist import azimuth, haversine
 from pysmo.tools.signal import remove_response
-from pysmo.tools.web import fetch_stationxml, fetch_travel_times
+from pysmo.tools.traveltime import travel_times
+from pysmo.tools.web import fetch_stationxml
 
 OUTPUT_DIR = Path(__file__).parent
 
@@ -95,7 +96,7 @@ def _deconvolve(sac: SAC, station: MiniStation) -> str:
     """
     seismogram = sac.seismogram
     xml = fetch_stationxml(station=station)
-    response = StationXML.from_bytes(xml, time=seismogram.begin_time)
+    response = StationXML.from_bytes(xml, time=seismogram.begin_time).response
 
     nyquist = 0.5 / seismogram.delta.total_seconds()
     stage_nyquist = min(
@@ -203,8 +204,8 @@ def _fetch_one_event(
     for station in stations:
         dist_deg = haversine(event, station)
         try:
-            travel_times = fetch_travel_times(event.depth / 1000.0, dist_deg, ["P"])
-            predicted_p = event.time + pd.Timedelta(seconds=travel_times["P"])
+            arrivals = travel_times(depth=event.depth, distance=dist_deg, phases=["P"])
+            predicted_p = event.time + arrivals["P"]
             starttime = predicted_p - MARGIN_BEFORE
             endtime = predicted_p + DURATION_AFTER
             sac = SAC.fetch(station=station, starttime=starttime, endtime=endtime)
