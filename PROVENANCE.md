@@ -54,6 +54,11 @@ AIMBAT's manual QC step than one with a few genuinely awkward examples.
   docstring names that combination as the cycle-skip signature. Kept
   as-is deliberately: a good real-world case for testing that workflow.
 
+- **`fiji_region`: pP at `AV.AKRB` cycle-skips in MCCC.** `AV.AKRB` has
+  the weakest P of the event, and its pP aligns in ICCS but MCCC moves it
+  by about 6 s, to a stack CC near zero. The pick is kept: a real case for
+  the manual QC step between ICCS and MCCC, here on the second phase.
+
 ## Station selection
 
 All 5 events share the same ~40-station set (rather than reselecting
@@ -86,10 +91,10 @@ event while succeeding for another.
 
 ## Window formula
 
-For each surviving station: `dist_deg = haversine(event, station)`,
-`arrivals = travel_times(depth=depth_m, distance=dist_deg, phases=["P"])`,
-`predicted_p = origin_time + arrivals["P"]`. The P arrival is computed
-locally (Buland–Chapman tau-p, iasp91), not fetched from a web service.
+For each surviving station, `predicted_arrivals` in `fetch_events.py`
+computes the predicted arrival of each of the event's phases (iasp91),
+locally rather than from a web service. `predicted_p` is the P arrival,
+from pysmo's tau-p solver (`travel_times`).
 
 - **Start** = `predicted_p − 2min`
 - **End** = `predicted_p + 3min`
@@ -130,8 +135,22 @@ pysmo's own `SacEvent` setters directly in Python (unlike
 which exists there to avoid round-tripping through the code under test —
 not a concern here). `iztype` is left at its default (`unkn`).
 
-Each file also gets an initial phase-arrival pick: `sac.timestamps.t0` is
-set to the same `predicted_p` used to anchor its fetch window.
+Each file also gets labelled initial picks, the predicted arrivals of its
+event's phases:
+
+| Phase | Header | Label | Events |
+|---|---|---|---|
+| P | `t0` | `kt0 = "P"` | all 5 |
+| pP | `t5` | `kt5 = "pP"` | `fiji_region` only |
+
+P is the same `predicted_p` that anchors the fetch window. pP is computed
+with ObsPy's TauP, since pysmo's solver does not cover depth phases.
+`traveltime_backends.py` names the travel-time backend for each phase.
+At 434 km depth, Fiji's pP arrives 94 to 99 s after P, inside the window.
+`t5` is clear of the `t1` to `t3` that AIMBAT v1 writes.
+`tests/test_dataset_integrity.py` checks the labels, and that each pick
+still agrees with its backend within 100 ms (the pP check only with ObsPy
+installed).
 
 Each event directory also has a `manifest.csv` (network, station,
 location, latitude, longitude, distance_deg, azimuth_deg, samples, o,
@@ -140,16 +159,18 @@ idep).
 ## SAC version 7
 
 Every file is written as v7 (`sac.native.nvhdr = 7`), which adds a
-double-precision footer for time headers. Needed because `o`/`t0` are
-derived from a real floating-point computation (`predicted_p`), and
-v6's float32 precision would visibly truncate them.
+double-precision footer for time headers. Needed because `o` and the
+picks are derived from a real floating-point computation, and v6's
+float32 precision would visibly truncate them.
 
 ## Regenerating
 
 ```sh
-uv sync
-uv run python fetch_events.py
+uv sync --group fetch
+uv run --group fetch python fetch_events.py
 ```
+
+The `fetch` dependency group brings ObsPy, needed only for pP.
 
 `pyproject.toml` pins `pysmo` to a specific commit via `[tool.uv.sources]`
 (`git = "https://github.com/pysmo/pysmo", rev = "<sha>"`), since

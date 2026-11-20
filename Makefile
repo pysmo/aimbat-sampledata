@@ -22,7 +22,7 @@ else
 endif
 
 fetch: check-uv sync ## Regenerate the dataset from USGS + EarthScope.
-	uv run python fetch_events.py
+	uv run --group fetch python fetch_events.py
 
 format: check-uv ## Sort imports and format code.
 	uv run ruff check --fix .

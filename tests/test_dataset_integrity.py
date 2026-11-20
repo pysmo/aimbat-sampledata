@@ -22,6 +22,9 @@ from fetch_events import (
     MARGIN_BEFORE,
     MAX_P_DISTANCE_DEG,
     OUTPUT_DIR,
+    PICK_HEADERS,
+    EventSpec,
+    predicted_arrivals,
 )
 
 EVENT_DIRS = sorted(OUTPUT_DIR.glob("Event_*"))
@@ -151,3 +154,48 @@ def test_shared_station_overlap() -> None:
     assert shared / len(counts) > 0.5, (
         "fewer than half of all stations are shared across multiple events"
     )
+
+
+EVENT_LABELS = {
+    "Event_2014.04.12.20.14.39.300": "solomon_islands",
+    "Event_2014.11.01.18.57.22.380": "fiji_region",
+    "Event_2015.04.25.06.11.25.950": "nepal",
+    "Event_2017.07.17.23.34.13.740": "komandorskiye_ostrova",
+    "Event_2017.11.12.18.18.17.180": "iraq",
+}
+PICK_TOLERANCE = pd.Timedelta(milliseconds=100)
+
+
+def _spec(event_dir: Path) -> EventSpec:
+    return next(spec for spec in EVENTS if spec.label == EVENT_LABELS[event_dir.name])
+
+
+def test_every_event_directory_has_a_label() -> None:
+    assert sorted(EVENT_LABELS) == [p.name for p in EVENT_DIRS]
+
+
+@pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
+def test_only_the_event_phases_are_picked(event_dir: Path) -> None:
+    phases = _spec(event_dir).phases
+    for sac_path in sorted(event_dir.glob("*.BHZ")):
+        sac = SAC.from_file(sac_path)
+        for phase, header in PICK_HEADERS.items():
+            time = getattr(sac.timestamps, header)
+            if phase in phases:
+                assert time is not None, f"{sac_path.name}: no {phase} pick"
+                label = getattr(sac.native, f"k{header}").strip()
+                assert label == phase, f"{sac_path.name}: k{header} is {label!r}"
+            else:
+                assert time is None, f"{sac_path.name}: unexpected {phase} pick"
+
+
+@pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
+def test_picks_track_their_backends(event_dir: Path) -> None:
+    spec = _spec(event_dir)
+    if "pP" in spec.phases:
+        pytest.importorskip("obspy")
+    for sac_path in sorted(event_dir.glob("*.BHZ")):
+        sac = SAC.from_file(sac_path)
+        for phase, time in predicted_arrivals(spec, sac.event, sac.station).items():
+            pick = getattr(sac.timestamps, PICK_HEADERS[phase])
+            assert abs(pick - time) < PICK_TOLERANCE, f"{sac_path.name}: {phase}"
