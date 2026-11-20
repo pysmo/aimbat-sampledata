@@ -2,7 +2,7 @@
 name = "aimbat-sampledata"
 version = "0.1.0"
 description = "Fetch script and provenance for pysmo/AIMBAT's example seismic dataset"
-requires-python = ">=3.13,<3.15"
+requires-python = ">=3.13,<3.16"
 dependencies = [
     "pysmo",
     "pandas>=2.0",
@@ -15,12 +15,15 @@ dev = [
     "pytest>=8.4.2",
     "ruff>=0.13.0",
 ]
+# Only fetch_events.py uses ObsPy (TauP travel times for pP), and only when
+# regenerating the dataset.
+fetch = ["obspy>=1.4"]
 
 [tool.uv]
 package = false
 
 [tool.uv.sources]
-pysmo = { git = "https://github.com/pysmo/pysmo", rev = "ddc1379f8fac4f7a17d1fe45851d085873f63361" }
+pysmo = { git = "https://github.com/pysmo/pysmo", rev = "325a5c0886673c860cada2dac0ef589edc52e227" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -30,6 +33,11 @@ pythonpath = ["."]
 disallow_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+# Only in the `fetch` group, and untyped.
+module = ["obspy", "obspy.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 extend-exclude = ["Event_*"]

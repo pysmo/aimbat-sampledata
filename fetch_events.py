@@ -2,11 +2,13 @@
 
 Downloads 5 teleseismic earthquakes recorded by Alaska's `AK`/`AV`/`TA`
 broadband networks (BHZ only), removes the instrument response, and
-annotates event metadata and an initial P-pick. See PROVENANCE.md for the
-event list, station-selection methodology, and window formula.
+annotates event metadata and labelled initial picks (P everywhere, pP for
+the deep Fiji event). See PROVENANCE.md for the event list,
+station-selection methodology, and window formula.
 
-Re-run with `uv run python fetch_events.py` from this directory to
-regenerate the dataset from scratch.
+Re-run with `uv run --group fetch python fetch_events.py` from this
+directory to regenerate the dataset from scratch. The `fetch` group brings
+ObsPy, which computes pP.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from pysmo import MiniEvent, MiniStation
+from pysmo import Event, MiniEvent, MiniStation, Station
 from pysmo.classes import SAC, StationXML
 from pysmo.functions import detrend, taper
 from pysmo.lib.io import (
@@ -30,8 +32,9 @@ from pysmo.lib.io import (
 )
 from pysmo.tools.azdist import azimuth, haversine
 from pysmo.tools.signal import remove_response
-from pysmo.tools.traveltime import travel_times
 from pysmo.tools.web import fetch_stationxml
+
+from traveltime_backends import arrival_times
 
 OUTPUT_DIR = Path(__file__).parent
 
@@ -51,15 +54,24 @@ MARGIN_BEFORE = pd.Timedelta(minutes=2)
 DURATION_AFTER = pd.Timedelta(minutes=3)
 
 
+# SAC header holding each phase's initial pick. The label goes in the
+# matching `k` header. pP uses t5, clear of the t1 to t3 that AIMBAT v1
+# writes.
+PICK_HEADERS = {"P": "t0", "pP": "t5"}
+
+
 @dataclass(frozen=True)
 class EventSpec:
     label: str
     usgs_eventid: str
+    # P first: it anchors the fetch window.
+    phases: tuple[str, ...] = ("P",)
 
 
 EVENTS = [
     EventSpec("komandorskiye_ostrova", "us20009x42"),
-    EventSpec("fiji_region", "usc000stdc"),
+    # 434 km deep: pP arrives 94 to 99 s after P, inside the window.
+    EventSpec("fiji_region", "usc000stdc", phases=("P", "pP")),
     EventSpec("nepal", "us20002926"),
     EventSpec("iraq", "us2000bmcg"),
     EventSpec("solomon_islands", "usc000phx5"),
@@ -192,6 +204,24 @@ def _select_common_stations(
     return _select_subset(candidates, count)
 
 
+def predicted_arrivals(
+    spec: EventSpec, event: Event, station: Station
+) -> dict[str, pd.Timestamp]:
+    """Predicted arrival time of each of the event's phases at a station."""
+    travel = arrival_times(
+        depth=event.depth, distance=haversine(event, station), phases=spec.phases
+    )
+    return {phase: event.time + time for phase, time in travel.items()}
+
+
+def set_picks(sac: SAC, arrivals: dict[str, pd.Timestamp]) -> None:
+    """Write each arrival as a labelled initial pick (`PICK_HEADERS`)."""
+    for phase, time in arrivals.items():
+        header = PICK_HEADERS[phase]
+        setattr(sac.timestamps, header, time)
+        setattr(sac.native, f"k{header}", phase)
+
+
 def _fetch_one_event(
     spec: EventSpec, event: MiniEvent, stations: list[MiniStation]
 ) -> None:
@@ -204,8 +234,8 @@ def _fetch_one_event(
     for station in stations:
         dist_deg = haversine(event, station)
         try:
-            arrivals = travel_times(depth=event.depth, distance=dist_deg, phases=["P"])
-            predicted_p = event.time + arrivals["P"]
+            arrivals = predicted_arrivals(spec, event, station)
+            predicted_p = arrivals["P"]
             starttime = predicted_p - MARGIN_BEFORE
             endtime = predicted_p + DURATION_AFTER
             sac = SAC.fetch(station=station, starttime=starttime, endtime=endtime)
@@ -230,7 +260,7 @@ def _fetch_one_event(
         sac.event.time = event.time
         assert sac.native.o is not None  # populated as soon as event.time is set
 
-        sac.timestamps.t0 = predicted_p  # initial pick, for ICCS-style workflows
+        set_picks(sac, arrivals)
 
         loc = station.location.strip()
         filename = f"{station.network}.{station.name}.{loc}.BHZ"
