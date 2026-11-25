@@ -3,10 +3,10 @@ revision = 5
 requires-python = ">=3.13, <3.16"
 resolution-markers = [
     "python_full_version >= '3.15' and sys_platform == 'win32'",
-    "python_full_version == '3.14.*' and sys_platform == 'win32'",
     "python_full_version >= '3.15' and sys_platform == 'emscripten'",
-    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version >= '3.15' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.14.*' and sys_platform == 'win32'",
+    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.14.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.14' and sys_platform == 'win32'",
     "python_full_version < '3.14' and sys_platform == 'emscripten'",
@@ -36,7 +36,7 @@ fetch = [
 [package.metadata]
 requires-dist = [
     { name = "pandas", specifier = ">=2.0" },
-    { name = "pysmo", git = "https://github.com/pysmo/pysmo?rev=325a5c0886673c860cada2dac0ef589edc52e227" },
+    { name = "pysmo", git = "https://github.com/pysmo/pysmo?rev=225a384226bb014039c9731036014e8d67259fa3" },
 ]
 
 [package.metadata.requires-dev]
@@ -1240,8 +1240,8 @@ wheels = [
 
 [[package]]
 name = "pysmo"
-version = "1.0.0.dev273+g325a5c088"
-source = { git = "https://github.com/pysmo/pysmo?rev=325a5c0886673c860cada2dac0ef589edc52e227#325a5c0886673c860cada2dac0ef589edc52e227" }
+version = "1.0.0.dev283+g225a38422"
+source = { git = "https://github.com/pysmo/pysmo?rev=225a384226bb014039c9731036014e8d67259fa3#225a384226bb014039c9731036014e8d67259fa3" }
 dependencies = [
     { name = "annotated-types" },
     { name = "attrs" },

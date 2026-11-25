@@ -1,14 +1,16 @@
 """Fetch this repo's Alaska teleseismic sample dataset from USGS + EarthScope.
 
-Downloads 5 teleseismic earthquakes recorded by Alaska's `AK`/`AV`/`TA`
-broadband networks (BHZ only), removes the instrument response, and
-annotates event metadata and labelled initial picks (P everywhere, pP for
-the deep Fiji event). See PROVENANCE.md for the event list,
-station-selection methodology, and window formula.
+Downloads 6 teleseismic earthquakes recorded by Alaska's `AK`/`AV`/`TA`
+broadband networks, removes the instrument response, resamples to 20 Hz,
+and annotates event metadata, channel orientation and labelled initial
+picks: P on BHZ for five events (pP too for the deep Fiji event), S on
+BHN/BHE for four of them, and SKS on BHN/BHE for a sixth event in the core
+shadow. See PROVENANCE.md for the event list, station-selection
+methodology, and window formula.
 
 Re-run with `uv run --group fetch python fetch_events.py` from this
 directory to regenerate the dataset from scratch. The `fetch` group brings
-ObsPy, which computes pP.
+ObsPy, which computes pP and SKS.
 """
 
 from __future__ import annotations
@@ -20,10 +22,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from attrs import evolve
 
 from pysmo import Event, MiniEvent, MiniStation, Station
 from pysmo.classes import SAC, StationXML
-from pysmo.functions import detrend, taper
+from pysmo.exceptions import MissingValueError
+from pysmo.functions import detrend, resample, taper
 from pysmo.lib.io import (
     DEFAULT_REQUEST_RETRIES,
     DEFAULT_RETRY_DELAY_SECONDS,
@@ -31,7 +35,7 @@ from pysmo.lib.io import (
     http_get,
 )
 from pysmo.tools.azdist import azimuth, haversine
-from pysmo.tools.signal import remove_response
+from pysmo.tools.signal import lowpass, remove_response
 from pysmo.tools.web import fetch_stationxml
 
 from traveltime_backends import arrival_times
@@ -44,38 +48,80 @@ USGS_EVENT_URL = "https://earthquake.usgs.gov/fdsnws/event/1/query"
 
 STATIONS_PER_EVENT = 40
 
-# Stays clear of the P shadow zone (~100 deg onwards) so every station
-# anchors on the same phase.
+# The sites `_select_common_stations` chose in November 2026. Pinned
+# because its result depends on what the station service lists at fetch
+# time, which changes; PROVENANCE.md and testkit's fixtures name these
+# sites. Re-run the selection only to change the set on purpose.
+PINNED_SITES = (
+    "AK.ATKA", "AK.BAL", "AK.BWN", "AK.CAPN", "AK.CAST", "AK.CCB", "AK.CHI",
+    "AK.CHUM", "AK.EYAK", "AK.FIRE", "AK.FYU", "AK.GRNC", "AK.HIN", "AK.JIS",
+    "AK.KAI", "AK.KHIT", "AK.KIAG", "AK.KLU", "AK.KNK", "AK.MCK", "AK.NICH",
+    "AK.PAX", "AK.PIN", "AK.PNL", "AK.SAMH", "AK.SKN", "AK.YAH", "AV.AKRB",
+    "AV.AU22", "AV.AUJA", "AV.MAPS", "AV.MSW", "AV.OKFG", "AV.RDDF", "AV.RDWB",
+    "AV.SPCN", "AV.SPCP", "AV.SSBA", "TA.POKR", "TA.TOLK",
+)  # fmt: skip
+
+# Stays clear of the P shadow zone (~100 deg onwards) so every station of
+# a P event anchors on the same phase.
 MAX_P_DISTANCE_DEG = 95.0
 
-# P-coda window: covers pick/QC headroom before P and the coda after,
-# well short of S and surface waves.
+# Window from MARGIN_BEFORE before an event's first phase to DURATION_AFTER
+# after its last: pick/QC headroom before, the coda after.
 MARGIN_BEFORE = pd.Timedelta(minutes=2)
 DURATION_AFTER = pd.Timedelta(minutes=3)
 
+# Sampling interval of every trace. 20 Hz is ample for P aligned at up to
+# 2 Hz and for S and SKS below 0.2 Hz.
+DELTA = pd.Timedelta(seconds=0.05)
+# Below the new Nyquist (10 Hz): resample's Fourier method cuts the
+# spectrum hard, so the low-pass keeps it from ringing.
+RESAMPLE_LOWPASS_HZ = 8.0
 
 # SAC header holding each phase's initial pick. The label goes in the
-# matching `k` header. pP uses t5, clear of the t1 to t3 that AIMBAT v1
-# writes.
-PICK_HEADERS = {"P": "t0", "pP": "t5"}
+# matching `k` header. t1 to t3 stay free for AIMBAT v1.
+PICK_HEADERS = {"P": "t0", "pP": "t5", "S": "t6", "SKS": "t7"}
+
+# Phases picked on the horizontals; the others are picked on BHZ.
+HORIZONTAL_PHASES = frozenset({"S", "SKS"})
+
+VERTICAL = ("BHZ",)
+THREE_COMPONENTS = ("BHZ", "BHN", "BHE")
 
 
 @dataclass(frozen=True)
 class EventSpec:
     label: str
     usgs_eventid: str
-    # P first: it anchors the fetch window.
     phases: tuple[str, ...] = ("P",)
+    channels: tuple[str, ...] = VERTICAL
 
 
 EVENTS = [
     EventSpec("komandorskiye_ostrova", "us20009x42"),
-    # 434 km deep: pP arrives 94 to 99 s after P, inside the window.
-    EventSpec("fiji_region", "usc000stdc", phases=("P", "pP")),
-    EventSpec("nepal", "us20002926"),
-    EventSpec("iraq", "us2000bmcg"),
-    EventSpec("solomon_islands", "usc000phx5"),
+    # 434 km deep: pP arrives 94 to 99 s after P.
+    EventSpec(
+        "fiji_region",
+        "usc000stdc",
+        phases=("P", "pP", "S"),
+        channels=THREE_COMPONENTS,
+    ),
+    EventSpec("nepal", "us20002926", phases=("P", "S"), channels=THREE_COMPONENTS),
+    EventSpec("iraq", "us2000bmcg", phases=("P", "S"), channels=THREE_COMPONENTS),
+    EventSpec(
+        "solomon_islands",
+        "usc000phx5",
+        phases=("P", "S"),
+        channels=THREE_COMPONENTS,
+    ),
+    # 88 to 108 deg from the sites: most are in the core shadow, so no P.
+    EventSpec("central_peru", "usb000s5x1", phases=("SKS",), channels=THREE_COMPONENTS),
 ]
+
+
+def phases_on_channel(spec: EventSpec, channel: str) -> tuple[str, ...]:
+    """The event's phases picked on `channel`."""
+    horizontal = channel[-1] != "Z"
+    return tuple(p for p in spec.phases if (p in HORIZONTAL_PHASES) == horizontal)
 
 
 def _fetch_event(eventid: str) -> MiniEvent:
@@ -100,15 +146,16 @@ def _fetch_event(eventid: str) -> MiniEvent:
 _IDEP_BY_UNITS = {"m": "disp", "m/s": "vel", "m/s**2": "acc"}
 
 
-def _deconvolve(sac: SAC, station: MiniStation) -> str:
+def _deconvolve(sac: SAC, station: MiniStation) -> tuple[str, StationXML]:
     """Remove the instrument response from `sac.seismogram`, in place.
 
     Returns the SAC `idep` value matching `response.input_units`, for the
-    caller to set.
+    caller to set, and the channel epoch, which carries the orientation.
     """
     seismogram = sac.seismogram
     xml = fetch_stationxml(station=station)
-    response = StationXML.from_bytes(xml, time=seismogram.begin_time).response
+    epoch = StationXML.from_bytes(xml, time=seismogram.begin_time)
+    response = epoch.response
 
     nyquist = 0.5 / seismogram.delta.total_seconds()
     stage_nyquist = min(
@@ -122,7 +169,17 @@ def _deconvolve(sac: SAC, station: MiniStation) -> str:
     detrend(seismogram)
     taper(seismogram, 0.05)
     remove_response(seismogram, response, pre_filt=(f1, f2, f3, f4))
-    return _IDEP_BY_UNITS.get(response.input_units.lower(), "unkn")
+    return _IDEP_BY_UNITS.get(response.input_units.lower(), "unkn"), epoch
+
+
+def _set_orientation(sac: SAC, epoch: StationXML) -> None:
+    """Copy the epoch's orientation, leaving the headers unset if it has none."""
+    try:
+        azimuth_deg, dip_deg = epoch.azimuth, epoch.dip
+    except MissingValueError:
+        return
+    sac.orientation.azimuth = azimuth_deg
+    sac.orientation.dip = dip_deg
 
 
 def _discover_stations(origin_time: pd.Timestamp) -> list[MiniStation]:
@@ -204,6 +261,22 @@ def _select_common_stations(
     return _select_subset(candidates, count)
 
 
+def _pinned_stations(events: list[MiniEvent]) -> list[MiniStation]:
+    """Look up the `PINNED_SITES` among the stations operating at the events.
+
+    Raises:
+        RuntimeError: If a pinned site is not listed at any of the events.
+    """
+    pool: dict[str, MiniStation] = {}
+    for event in events:
+        for station in _discover_stations(event.time):
+            pool.setdefault(f"{station.network}.{station.name}", station)
+    missing = [site for site in PINNED_SITES if site not in pool]
+    if missing:
+        raise RuntimeError(f"pinned sites not listed: {', '.join(missing)}")
+    return [pool[site] for site in PINNED_SITES]
+
+
 def predicted_arrivals(
     spec: EventSpec, event: Event, station: Station
 ) -> dict[str, pd.Timestamp]:
@@ -214,12 +287,40 @@ def predicted_arrivals(
     return {phase: event.time + time for phase, time in travel.items()}
 
 
-def set_picks(sac: SAC, arrivals: dict[str, pd.Timestamp]) -> None:
-    """Write each arrival as a labelled initial pick (`PICK_HEADERS`)."""
-    for phase, time in arrivals.items():
+def set_picks(
+    sac: SAC, arrivals: dict[str, pd.Timestamp], phases: tuple[str, ...]
+) -> None:
+    """Write the arrival of each of `phases` as a labelled initial pick (`PICK_HEADERS`)."""
+    for phase in phases:
+        time = arrivals[phase]
         header = PICK_HEADERS[phase]
         setattr(sac.timestamps, header, time)
         setattr(sac.native, f"k{header}", phase)
+
+
+def _fetch_channel(
+    station: MiniStation, starttime: pd.Timestamp, endtime: pd.Timestamp
+) -> tuple[SAC, str]:
+    """Fetch one channel, remove its response and resample it to `DELTA`.
+
+    Returns the SAC and its `idep`.
+
+    Raises:
+        RuntimeError: If the data are incomplete.
+    """
+    sac = SAC.fetch(station=station, starttime=starttime, endtime=endtime)
+    # dataselect can return a short prefix instead of erroring outright
+    # when the station has a data gap partway through the window.
+    if sac.seismogram.end_time < endtime - pd.Timedelta(seconds=1):
+        raise RuntimeError(
+            f"incomplete data: got {sac.seismogram.begin_time} to "
+            f"{sac.seismogram.end_time}, requested up to {endtime}"
+        )
+    idep, epoch = _deconvolve(sac, station)
+    lowpass(sac.seismogram, RESAMPLE_LOWPASS_HZ, corners=4, zerophase=True)
+    resample(sac.seismogram, DELTA)
+    _set_orientation(sac, epoch)
+    return sac, idep
 
 
 def _fetch_one_event(
@@ -233,54 +334,56 @@ def _fetch_one_event(
     manifest_rows: list[dict[str, object]] = []
     for station in stations:
         dist_deg = haversine(event, station)
+        # A site is kept only with every channel of the event, all sharing
+        # one window.
         try:
             arrivals = predicted_arrivals(spec, event, station)
-            predicted_p = arrivals["P"]
-            starttime = predicted_p - MARGIN_BEFORE
-            endtime = predicted_p + DURATION_AFTER
-            sac = SAC.fetch(station=station, starttime=starttime, endtime=endtime)
-            # dataselect can return a short prefix instead of erroring outright
-            # when the station has a data gap partway through the window.
-            if sac.seismogram.end_time < endtime - pd.Timedelta(seconds=1):
-                raise RuntimeError(
-                    f"incomplete data: got {sac.seismogram.begin_time} to "
-                    f"{sac.seismogram.end_time}, requested up to {endtime}"
+            starttime = min(arrivals.values()) - MARGIN_BEFORE
+            endtime = max(arrivals.values()) + DURATION_AFTER
+            fetched = [
+                (
+                    channel,
+                    *_fetch_channel(
+                        evolve(station, channel=channel), starttime, endtime
+                    ),
                 )
-            idep = _deconvolve(sac, station)
+                for channel in spec.channels
+            ]
         except Exception as exc:  # noqa: BLE001 - skip and log, don't abort the run
             print(f"skip {station.network}.{station.name}: {exc}")
             continue
 
-        sac.native.idep = idep
-        # v7 for double-precision o/t0 (float32 visibly truncates predicted_p).
-        sac.native.nvhdr = 7
-        sac.event.latitude = event.latitude
-        sac.event.longitude = event.longitude
-        sac.event.depth = event.depth
-        sac.event.time = event.time
-        assert sac.native.o is not None  # populated as soon as event.time is set
-
-        set_picks(sac, arrivals)
-
         loc = station.location.strip()
-        filename = f"{station.network}.{station.name}.{loc}.BHZ"
-        sac.write(event_dir / filename)
+        for channel, sac, idep in fetched:
+            sac.native.idep = idep
+            sac.event.latitude = event.latitude
+            sac.event.longitude = event.longitude
+            sac.event.depth = event.depth
+            sac.event.time = event.time
+            assert sac.native.o is not None  # populated as soon as event.time is set
 
-        manifest_rows.append(
-            {
-                "network": station.network,
-                "station": station.name,
-                "location": loc,
-                "latitude": station.latitude,
-                "longitude": station.longitude,
-                "distance_deg": round(dist_deg, 4),
-                "azimuth_deg": round(azimuth(event, station), 4),
-                "samples": len(sac.seismogram.data),
-                "o": round(sac.native.o, 3),
-                "idep": idep,
-            }
-        )
-        print(f"fetched {filename}: {starttime} to {endtime}")
+            set_picks(sac, arrivals, phases_on_channel(spec, channel))
+
+            filename = f"{station.network}.{station.name}.{loc}.{channel}"
+            # v7 for double-precision o/t0 (float32 visibly truncates the picks).
+            sac.write(event_dir / filename, nvhdr=7)
+
+            manifest_rows.append(
+                {
+                    "network": station.network,
+                    "station": station.name,
+                    "location": loc,
+                    "channel": channel,
+                    "latitude": station.latitude,
+                    "longitude": station.longitude,
+                    "distance_deg": round(dist_deg, 4),
+                    "azimuth_deg": round(azimuth(event, station), 4),
+                    "samples": len(sac.seismogram.data),
+                    "o": round(sac.native.o, 3),
+                    "idep": idep,
+                }
+            )
+            print(f"fetched {filename}: {starttime} to {endtime}")
 
     if not manifest_rows:
         raise RuntimeError(f"{spec.label}: no stations fetched, check geometry")
@@ -289,13 +392,16 @@ def _fetch_one_event(
         writer = csv.DictWriter(fh, fieldnames=list(manifest_rows[0].keys()))
         writer.writeheader()
         writer.writerows(manifest_rows)
-    print(f"{spec.label}: {len(manifest_rows)}/{len(stations)} stations fetched")
+    print(f"{spec.label}: {len(manifest_rows)} files fetched")
 
 
 def main() -> None:
     fetched = [(spec, _fetch_event(spec.usgs_eventid)) for spec in EVENTS]
 
-    shared_stations = _select_common_stations([event for _, event in fetched])
+    # The P events locate the pinned sites; the SKS event uses the same ones.
+    shared_stations = _pinned_stations(
+        [event for spec, event in fetched if "P" in spec.phases]
+    )
     for spec, event in fetched:
         _fetch_one_event(spec, event, shared_stations)
 

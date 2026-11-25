@@ -23,7 +23,7 @@ fetch = ["obspy>=1.4"]
 package = false
 
 [tool.uv.sources]
-pysmo = { git = "https://github.com/pysmo/pysmo", rev = "325a5c0886673c860cada2dac0ef589edc52e227" }
+pysmo = { git = "https://github.com/pysmo/pysmo", rev = "225a384226bb014039c9731036014e8d67259fa3" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
