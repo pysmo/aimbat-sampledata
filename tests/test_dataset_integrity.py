@@ -8,7 +8,7 @@ commit.
 
 import csv
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -17,18 +17,22 @@ import pytest
 from pysmo.classes import SAC
 
 from fetch_events import (
+    DELTA,
     DURATION_AFTER,
     EVENTS,
     MARGIN_BEFORE,
     MAX_P_DISTANCE_DEG,
     OUTPUT_DIR,
     PICK_HEADERS,
+    PINNED_SITES,
     EventSpec,
+    phases_on_channel,
     predicted_arrivals,
 )
 
 EVENT_DIRS = sorted(OUTPUT_DIR.glob("Event_*"))
-EXPECTED_WINDOW = MARGIN_BEFORE + DURATION_AFTER
+SAC_GLOB = "*.BH?"
+MIN_WINDOW = MARGIN_BEFORE + DURATION_AFTER
 TRUNCATION_TOLERANCE = pd.Timedelta(seconds=2)
 EVENT_DIR_PATTERN = re.compile(
     r"Event_(\d{4})\.(\d{2})\.(\d{2})\.(\d{2})\.(\d{2})\.(\d{2})\.(\d{3})$"
@@ -37,6 +41,7 @@ MANIFEST_FIELDS = [
     "network",
     "station",
     "location",
+    "channel",
     "latitude",
     "longitude",
     "distance_deg",
@@ -50,6 +55,10 @@ MANIFEST_FIELDS = [
 def _manifest_rows(event_dir: Path) -> list[dict[str, str]]:
     with (event_dir / "manifest.csv").open(newline="") as fh:
         return list(csv.DictReader(fh))
+
+
+def _sac_paths(event_dir: Path) -> list[Path]:
+    return sorted(event_dir.glob(SAC_GLOB))
 
 
 def _origin_time_from_dirname(event_dir: Path) -> pd.Timestamp:
@@ -78,12 +87,12 @@ def test_one_directory_per_event() -> None:
 
 @pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
 def test_manifest_matches_files_on_disk(event_dir: Path) -> None:
-    """No orphaned `.BHZ` files, and no manifest row missing its file."""
+    """No orphaned SAC files, and no manifest row missing its file."""
     rows = _manifest_rows(event_dir)
     manifest_files = {
-        f"{r['network']}.{r['station']}.{r['location']}.BHZ" for r in rows
+        f"{r['network']}.{r['station']}.{r['location']}.{r['channel']}" for r in rows
     }
-    disk_files = {p.name for p in event_dir.glob("*.BHZ")}
+    disk_files = {p.name for p in _sac_paths(event_dir)}
     assert manifest_files == disk_files
 
 
@@ -95,7 +104,26 @@ def test_manifest_has_expected_columns(event_dir: Path) -> None:
 
 
 @pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
-def test_stations_within_shadow_zone(event_dir: Path) -> None:
+def test_only_pinned_sites(event_dir: Path) -> None:
+    sites = {f"{r['network']}.{r['station']}" for r in _manifest_rows(event_dir)}
+    assert sites <= set(PINNED_SITES), sorted(sites - set(PINNED_SITES))
+
+
+@pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
+def test_every_site_has_every_channel(event_dir: Path) -> None:
+    """A site is kept only with all of the event's channels."""
+    channels: defaultdict[str, set[str]] = defaultdict(set)
+    for row in _manifest_rows(event_dir):
+        channels[f"{row['network']}.{row['station']}"].add(row["channel"])
+    expected = set(_spec(event_dir).channels)
+    for site, found in channels.items():
+        assert found == expected, f"{site}: {sorted(found)}"
+
+
+@pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
+def test_p_event_stations_within_shadow_zone(event_dir: Path) -> None:
+    if "P" not in _spec(event_dir).phases:
+        pytest.skip("no P phase")
     for row in _manifest_rows(event_dir):
         assert float(row["distance_deg"]) < MAX_P_DISTANCE_DEG
 
@@ -103,15 +131,46 @@ def test_stations_within_shadow_zone(event_dir: Path) -> None:
 @pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
 def test_seismograms_are_not_truncated(event_dir: Path) -> None:
     """A short prefix instead of the full window (a real FDSN data gap) may
-    not even reach the P arrival — useless for ICCS/MCCC and confusing in
-    AIMBAT.
+    not even reach the first arrival — useless for ICCS/MCCC and confusing
+    in AIMBAT.
     """
-    for sac_path in sorted(event_dir.glob("*.BHZ")):
+    for sac_path in _sac_paths(event_dir):
         sac = SAC.from_file(sac_path)
         duration = sac.seismogram.end_time - sac.seismogram.begin_time
-        assert duration >= EXPECTED_WINDOW - TRUNCATION_TOLERANCE, (
-            f"{sac_path.name}: only {duration} of data, expected ~{EXPECTED_WINDOW}"
+        assert duration >= MIN_WINDOW - TRUNCATION_TOLERANCE, (
+            f"{sac_path.name}: only {duration} of data, expected at least ~{MIN_WINDOW}"
         )
+
+
+@pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
+def test_channels_of_a_site_share_the_window(event_dir: Path) -> None:
+    windows: defaultdict[str, set[tuple[pd.Timestamp, int]]] = defaultdict(set)
+    for sac_path in _sac_paths(event_dir):
+        sac = SAC.from_file(sac_path)
+        site = sac_path.name.rsplit(".", 1)[0]
+        begin = sac.seismogram.begin_time.round(DELTA)
+        windows[site].add((begin, len(sac.seismogram.data)))
+    for site, found in windows.items():
+        assert len(found) == 1, f"{site}: {found}"
+
+
+@pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
+def test_sampling_interval(event_dir: Path) -> None:
+    for sac_path in _sac_paths(event_dir):
+        sac = SAC.from_file(sac_path)
+        assert sac.seismogram.delta == DELTA, f"{sac_path.name}: {sac.seismogram.delta}"
+
+
+@pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
+def test_orientation_is_set(event_dir: Path) -> None:
+    """Every sample site has orientation in StationXML: Z points up, the
+    horizontals lie flat.
+    """
+    for sac_path in _sac_paths(event_dir):
+        sac = SAC.from_file(sac_path)
+        expected_dip = -90.0 if sac_path.name.endswith("Z") else 0.0
+        assert sac.orientation.dip == pytest.approx(expected_dip), sac_path.name
+        assert 0 <= sac.orientation.azimuth < 360, sac_path.name
 
 
 # SAC v7's double-precision footer still leaves a few ns of float64 rounding
@@ -130,7 +189,7 @@ def test_event_time_is_read_back_precisely(event_dir: Path) -> None:
     which adds a double-precision footer.
     """
     expected = _origin_time_from_dirname(event_dir)
-    for sac_path in sorted(event_dir.glob("*.BHZ")):
+    for sac_path in _sac_paths(event_dir):
         sac = SAC.from_file(sac_path)
         assert sac.native.nvhdr == 7, f"{sac_path.name}: not SAC v7"
         drift = abs(sac.event.time - expected)
@@ -145,10 +204,11 @@ def test_shared_station_overlap() -> None:
     stations independently per event barely overlapped station-to-station
     across events, defeating the point of a multi-event ICCS/MCCC dataset.
     """
-    counts: Counter[str] = Counter()
+    events_per_site: defaultdict[str, set[str]] = defaultdict(set)
     for event_dir in EVENT_DIRS:
         for row in _manifest_rows(event_dir):
-            counts[f"{row['network']}.{row['station']}"] += 1
+            events_per_site[f"{row['network']}.{row['station']}"].add(event_dir.name)
+    counts = Counter({site: len(events) for site, events in events_per_site.items()})
 
     shared = sum(1 for n in counts.values() if n >= 2)
     assert shared / len(counts) > 0.5, (
@@ -158,16 +218,22 @@ def test_shared_station_overlap() -> None:
 
 EVENT_LABELS = {
     "Event_2014.04.12.20.14.39.300": "solomon_islands",
+    "Event_2014.08.24.23.21.45.520": "central_peru",
     "Event_2014.11.01.18.57.22.380": "fiji_region",
     "Event_2015.04.25.06.11.25.950": "nepal",
     "Event_2017.07.17.23.34.13.740": "komandorskiye_ostrova",
     "Event_2017.11.12.18.18.17.180": "iraq",
 }
 PICK_TOLERANCE = pd.Timedelta(milliseconds=100)
+TAUP_PHASES = {"pP", "SKS"}
 
 
 def _spec(event_dir: Path) -> EventSpec:
     return next(spec for spec in EVENTS if spec.label == EVENT_LABELS[event_dir.name])
+
+
+def _channel(sac_path: Path) -> str:
+    return sac_path.name.rsplit(".", 1)[1]
 
 
 def test_every_event_directory_has_a_label() -> None:
@@ -175,9 +241,11 @@ def test_every_event_directory_has_a_label() -> None:
 
 
 @pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
-def test_only_the_event_phases_are_picked(event_dir: Path) -> None:
-    phases = _spec(event_dir).phases
-    for sac_path in sorted(event_dir.glob("*.BHZ")):
+def test_only_the_channel_phases_are_picked(event_dir: Path) -> None:
+    """P and pP only on BHZ, S and SKS only on the horizontals."""
+    spec = _spec(event_dir)
+    for sac_path in _sac_paths(event_dir):
+        phases = phases_on_channel(spec, _channel(sac_path))
         sac = SAC.from_file(sac_path)
         for phase, header in PICK_HEADERS.items():
             time = getattr(sac.timestamps, header)
@@ -192,10 +260,13 @@ def test_only_the_event_phases_are_picked(event_dir: Path) -> None:
 @pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
 def test_picks_track_their_backends(event_dir: Path) -> None:
     spec = _spec(event_dir)
-    if "pP" in spec.phases:
+    if TAUP_PHASES & set(spec.phases):
         pytest.importorskip("obspy")
-    for sac_path in sorted(event_dir.glob("*.BHZ")):
+    for sac_path in _sac_paths(event_dir):
         sac = SAC.from_file(sac_path)
-        for phase, time in predicted_arrivals(spec, sac.event, sac.station).items():
+        arrivals = predicted_arrivals(spec, sac.event, sac.station)
+        for phase in phases_on_channel(spec, _channel(sac_path)):
             pick = getattr(sac.timestamps, PICK_HEADERS[phase])
-            assert abs(pick - time) < PICK_TOLERANCE, f"{sac_path.name}: {phase}"
+            assert abs(pick - arrivals[phase]) < PICK_TOLERANCE, (
+                f"{sac_path.name}: {phase}"
+            )

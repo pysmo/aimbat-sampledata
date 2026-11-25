@@ -2,9 +2,9 @@
 
 Each backend has the shape of `pysmo.tools.traveltime.TravelTimeBackend`.
 `PHASE_BACKENDS` names the backend used for each phase. pysmo's built-in
-solver covers P but not depth phases, so pP comes from ObsPy's TauP for
-now. Moving pP to pysmo once its solver covers it means changing its entry
-in `PHASE_BACKENDS`.
+solver covers P and S but not depth or core phases, so pP and SKS come
+from ObsPy's TauP for now. Moving them to pysmo once its solver covers
+them means changing their entries in `PHASE_BACKENDS`.
 
 ObsPy is imported inside `obspy_taup`, so importing this module needs no
 ObsPy. It is in the `fetch` dependency group only.
@@ -52,6 +52,8 @@ def obspy_taup(
 PHASE_BACKENDS: dict[str, TravelTimeBackend] = {
     "P": pysmo_builtin,
     "pP": obspy_taup,
+    "S": pysmo_builtin,
+    "SKS": obspy_taup,
 }
 
 
