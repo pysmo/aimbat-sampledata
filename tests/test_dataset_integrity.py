@@ -11,10 +11,12 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from pysmo.classes import SAC
+from pysmo.tools.azdist import backazimuth
 
 from fetch_events import (
     DELTA,
@@ -26,7 +28,6 @@ from fetch_events import (
     PICK_HEADERS,
     PINNED_SITES,
     EventSpec,
-    phases_on_channel,
     predicted_arrivals,
 )
 
@@ -49,6 +50,7 @@ MANIFEST_FIELDS = [
     "samples",
     "o",
     "idep",
+    "incidence_deg",
 ]
 
 
@@ -111,11 +113,11 @@ def test_only_pinned_sites(event_dir: Path) -> None:
 
 @pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
 def test_every_site_has_every_channel(event_dir: Path) -> None:
-    """A site is kept only with all of the event's channels."""
+    """A site is kept only with all of the event's output channels."""
     channels: defaultdict[str, set[str]] = defaultdict(set)
     for row in _manifest_rows(event_dir):
         channels[f"{row['network']}.{row['station']}"].add(row["channel"])
-    expected = set(_spec(event_dir).channels)
+    expected = set(_spec(event_dir).outputs)
     for site, found in channels.items():
         assert found == expected, f"{site}: {sorted(found)}"
 
@@ -163,14 +165,50 @@ def test_sampling_interval(event_dir: Path) -> None:
 
 @pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
 def test_orientation_is_set(event_dir: Path) -> None:
-    """Every sample site has orientation in StationXML: Z points up, the
-    horizontals lie flat.
+    """Z points up, T lies flat at the back azimuth + 270, and L and Q lie in
+    the vertical plane through the ray at the back azimuth + 180, with dips
+    `incidence - 90` and `incidence`.
     """
+    incidences = {
+        f"{r['network']}.{r['station']}.{r['location']}": r["incidence_deg"]
+        for r in _manifest_rows(event_dir)
+    }
     for sac_path in _sac_paths(event_dir):
         sac = SAC.from_file(sac_path)
-        expected_dip = -90.0 if sac_path.name.endswith("Z") else 0.0
-        assert sac.orientation.dip == pytest.approx(expected_dip), sac_path.name
-        assert 0 <= sac.orientation.azimuth < 360, sac_path.name
+        channel = _channel(sac_path)
+        if channel == "BHZ":
+            assert sac.orientation.dip == pytest.approx(-90.0), sac_path.name
+            continue
+        baz = backazimuth(sac.event, sac.station)
+        if channel == "BHT":
+            expected = ((baz + 270) % 360, 0.0)
+        else:
+            incidence = float(incidences[sac_path.name.rsplit(".", 1)[0]])
+            dip = incidence - 90 if channel == "BHL" else incidence
+            expected = ((baz + 180) % 360, dip)
+        found = (sac.orientation.azimuth, sac.orientation.dip)
+        assert found == pytest.approx(expected, abs=1e-3), sac_path.name
+
+
+@pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
+def test_q_is_rotated_from_z_and_r(event_dir: Path) -> None:
+    """Q = -Z sin(i) + R cos(i), with R recovered from Q and L."""
+    spec = _spec(event_dir)
+    if "BHQ" not in spec.outputs:
+        pytest.skip("no BHQ")
+    for row in _manifest_rows(event_dir):
+        if row["channel"] != "BHQ":
+            continue
+        site = f"{row['network']}.{row['station']}.{row['location']}"
+        z, l_, q = (
+            np.asarray(SAC.from_file(event_dir / f"{site}.{c}").seismogram.data)
+            for c in ("BHZ", "BHL", "BHQ")
+        )
+        i = np.radians(float(row["incidence_deg"]))
+        # L = Z cos i + R sin i, so R follows from Z and L.
+        r = (l_ - z * np.cos(i)) / np.sin(i)
+        expected = -z * np.sin(i) + r * np.cos(i)
+        np.testing.assert_allclose(q, expected, atol=1e-4 * np.abs(q).max())
 
 
 # SAC v7's double-precision footer still leaves a few ns of float64 rounding
@@ -241,11 +279,11 @@ def test_every_event_directory_has_a_label() -> None:
 
 
 @pytest.mark.parametrize("event_dir", EVENT_DIRS, ids=lambda p: p.name)
-def test_only_the_channel_phases_are_picked(event_dir: Path) -> None:
-    """P and pP only on BHZ, S and SKS only on the horizontals."""
+def test_every_phase_is_picked_on_every_channel(event_dir: Path) -> None:
+    """Each channel of a site carries every pick of the event, and no other."""
     spec = _spec(event_dir)
     for sac_path in _sac_paths(event_dir):
-        phases = phases_on_channel(spec, _channel(sac_path))
+        phases = spec.phases
         sac = SAC.from_file(sac_path)
         for phase, header in PICK_HEADERS.items():
             time = getattr(sac.timestamps, header)
@@ -265,7 +303,7 @@ def test_picks_track_their_backends(event_dir: Path) -> None:
     for sac_path in _sac_paths(event_dir):
         sac = SAC.from_file(sac_path)
         arrivals = predicted_arrivals(spec, sac.event, sac.station)
-        for phase in phases_on_channel(spec, _channel(sac_path)):
+        for phase in spec.phases:
             pick = getattr(sac.timestamps, PICK_HEADERS[phase])
             assert abs(pick - arrivals[phase]) < PICK_TOLERANCE, (
                 f"{sac_path.name}: {phase}"

@@ -2,19 +2,22 @@
 
 Downloads 6 teleseismic earthquakes recorded by Alaska's `AK`/`AV`/`TA`
 broadband networks, removes the instrument response, resamples to 20 Hz,
-and annotates event metadata, channel orientation and labelled initial
-picks: P on BHZ for five events (pP too for the deep Fiji event), S on
-BHN/BHE for four of them, and SKS on BHN/BHE for a sixth event in the core
-shadow. See PROVENANCE.md for the event list, station-selection
-methodology, and window formula.
+rotates the horizontals, and annotates event metadata, channel orientation
+and labelled initial picks. Five events have P (pP too for the deep Fiji
+event), four of them S, and a sixth event in the core shadow SKS. The S
+events are written as BHZ and BHT, the SKS event as BHZ, BHL, BHQ and BHT
+(rotated with the SKS incidence angle), the remaining event as BHZ. Every
+pick of a site is on every channel of the site. See PROVENANCE.md for the
+event list, station-selection methodology, and window formula.
 
 Re-run with `uv run --group fetch python fetch_events.py` from this
 directory to regenerate the dataset from scratch. The `fetch` group brings
-ObsPy, which computes pP and SKS.
+ObsPy, which computes pP and SKS and the SKS incidence angle.
 """
 
 from __future__ import annotations
 
+import copy
 import csv
 import json
 from dataclasses import dataclass
@@ -34,11 +37,18 @@ from pysmo.lib.io import (
     DEFAULT_TIMEOUT_SECONDS,
     http_get,
 )
-from pysmo.tools.azdist import azimuth, haversine
+from pysmo.tools.azdist import azimuth, backazimuth, haversine
+from pysmo.tools.components import (
+    Components,
+    lqt_orientations,
+    rotate_to_lqt,
+    rotate_to_rt,
+    rt_orientations,
+)
 from pysmo.tools.signal import lowpass, remove_response
 from pysmo.tools.web import fetch_stationxml
 
-from traveltime_backends import arrival_times
+from traveltime_backends import arrival_times, incidence_angle
 
 OUTPUT_DIR = Path(__file__).parent
 
@@ -81,19 +91,27 @@ RESAMPLE_LOWPASS_HZ = 8.0
 # matching `k` header. t1 to t3 stay free for AIMBAT v1.
 PICK_HEADERS = {"P": "t0", "pP": "t5", "S": "t6", "SKS": "t7"}
 
-# Phases picked on the horizontals; the others are picked on BHZ.
-HORIZONTAL_PHASES = frozenset({"S", "SKS"})
-
 VERTICAL = ("BHZ",)
 THREE_COMPONENTS = ("BHZ", "BHN", "BHE")
+ZT = ("BHZ", "BHT")
+ZLQT = ("BHZ", "BHL", "BHQ", "BHT")
 
 
 @dataclass(frozen=True)
 class EventSpec:
+    """An event, the channels fetched for it and the channels written.
+
+    Channels written but not fetched are rotated from the fetched ones: T
+    alone with the back azimuth, L, Q and T with the incidence angle of
+    `incidence_phase` too.
+    """
+
     label: str
     usgs_eventid: str
     phases: tuple[str, ...] = ("P",)
     channels: tuple[str, ...] = VERTICAL
+    outputs: tuple[str, ...] = VERTICAL
+    incidence_phase: str | None = None
 
 
 EVENTS = [
@@ -104,24 +122,80 @@ EVENTS = [
         "usc000stdc",
         phases=("P", "pP", "S"),
         channels=THREE_COMPONENTS,
+        outputs=ZT,
     ),
-    EventSpec("nepal", "us20002926", phases=("P", "S"), channels=THREE_COMPONENTS),
-    EventSpec("iraq", "us2000bmcg", phases=("P", "S"), channels=THREE_COMPONENTS),
+    EventSpec(
+        "nepal", "us20002926", phases=("P", "S"), channels=THREE_COMPONENTS, outputs=ZT
+    ),
+    EventSpec(
+        "iraq", "us2000bmcg", phases=("P", "S"), channels=THREE_COMPONENTS, outputs=ZT
+    ),
     EventSpec(
         "solomon_islands",
         "usc000phx5",
         phases=("P", "S"),
         channels=THREE_COMPONENTS,
+        outputs=ZT,
     ),
     # 88 to 108 deg from the sites: most are in the core shadow, so no P.
-    EventSpec("central_peru", "usb000s5x1", phases=("SKS",), channels=THREE_COMPONENTS),
+    EventSpec(
+        "central_peru",
+        "usb000s5x1",
+        phases=("SKS",),
+        channels=THREE_COMPONENTS,
+        outputs=ZLQT,
+        incidence_phase="SKS",
+    ),
 ]
 
 
-def phases_on_channel(spec: EventSpec, channel: str) -> tuple[str, ...]:
-    """The event's phases picked on `channel`."""
-    horizontal = channel[-1] != "Z"
-    return tuple(p for p in spec.phases if (p in HORIZONTAL_PHASES) == horizontal)
+def rotated_channels(
+    spec: EventSpec, event: Event, station: Station, sacs: dict[str, SAC]
+) -> tuple[dict[str, SAC], float | None]:
+    """The SAC of each of the event's output channels, and the incidence angle used.
+
+    Fetched channels are returned as they are. The others are copies of the
+    site's BHZ with the rotated data, channel code and orientation.
+    """
+    missing = [channel for channel in spec.outputs if channel not in sacs]
+    if not missing:
+        return {channel: sacs[channel] for channel in spec.outputs}, None
+    components = Components(
+        [(sacs[c].seismogram, sacs[c].orientation) for c in THREE_COMPONENTS]
+    )
+    baz = backazimuth(event, station)
+    incidence = None
+    if spec.incidence_phase is None:
+        rotated = dict(
+            zip(
+                ("BHR", "BHT"), zip(rotate_to_rt(components, baz), rt_orientations(baz))
+            )
+        )
+    else:
+        incidence = incidence_angle(
+            depth=event.depth,
+            distance=haversine(event, station),
+            phase=spec.incidence_phase,
+        )
+        rotated = dict(
+            zip(
+                ("BHL", "BHQ", "BHT"),
+                zip(
+                    rotate_to_lqt(components, baz, incidence),
+                    lqt_orientations(baz, incidence),
+                ),
+            )
+        )
+    out = {channel: sacs[channel] for channel in spec.outputs if channel in sacs}
+    for channel in missing:
+        seismogram, orientation = rotated[channel]
+        sac = copy.deepcopy(sacs["BHZ"])
+        sac.seismogram.data = seismogram.data
+        sac.station.channel = channel
+        sac.orientation.azimuth = orientation.azimuth
+        sac.orientation.dip = orientation.dip
+        out[channel] = sac
+    return {channel: out[channel] for channel in spec.outputs}, incidence
 
 
 def _fetch_event(eventid: str) -> MiniEvent:
@@ -349,12 +423,16 @@ def _fetch_one_event(
                 )
                 for channel in spec.channels
             ]
+            idep = fetched[0][2]
+            outputs, incidence = rotated_channels(
+                spec, event, station, {channel: sac for channel, sac, _ in fetched}
+            )
         except Exception as exc:  # noqa: BLE001 - skip and log, don't abort the run
             print(f"skip {station.network}.{station.name}: {exc}")
             continue
 
         loc = station.location.strip()
-        for channel, sac, idep in fetched:
+        for channel, sac in outputs.items():
             sac.native.idep = idep
             sac.event.latitude = event.latitude
             sac.event.longitude = event.longitude
@@ -362,7 +440,7 @@ def _fetch_one_event(
             sac.event.time = event.time
             assert sac.native.o is not None  # populated as soon as event.time is set
 
-            set_picks(sac, arrivals, phases_on_channel(spec, channel))
+            set_picks(sac, arrivals, spec.phases)
 
             filename = f"{station.network}.{station.name}.{loc}.{channel}"
             # v7 for double-precision o/t0 (float32 visibly truncates the picks).
@@ -381,6 +459,7 @@ def _fetch_one_event(
                     "samples": len(sac.seismogram.data),
                     "o": round(sac.native.o, 3),
                     "idep": idep,
+                    "incidence_deg": "" if incidence is None else round(incidence, 4),
                 }
             )
             print(f"fetched {filename}: {starttime} to {endtime}")
