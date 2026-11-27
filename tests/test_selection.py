@@ -2,7 +2,7 @@
 
 from pysmo import MiniStation
 
-from fetch_events import EventSpec, _select_subset, phases_on_channel
+from fetch_events import _select_subset
 
 
 def _station(name: str, lat: float) -> MiniStation:
@@ -43,10 +43,3 @@ def test_select_subset_is_deterministic() -> None:
     first = [s.name for s in _select_subset(stations, 15)]
     second = [s.name for s in _select_subset(stations, 15)]
     assert first == second
-
-
-def test_phases_on_channel() -> None:
-    spec = EventSpec("x", "x", phases=("P", "pP", "S", "SKS"))
-    assert phases_on_channel(spec, "BHZ") == ("P", "pP")
-    assert phases_on_channel(spec, "BHN") == ("S", "SKS")
-    assert phases_on_channel(spec, "BHE") == ("S", "SKS")

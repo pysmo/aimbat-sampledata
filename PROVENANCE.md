@@ -3,9 +3,11 @@
 6 real teleseismic earthquakes, each recorded by a subset of Alaska's `AK`
 (Alaska Earthquake Center), `AV` (Alaska Volcano Observatory, USGS/UAF-GI),
 and `TA` (USArray Transportable Array, NSF-funded EarthScope/IRIS)
-broadband networks. One event has BHZ only, the other five BHZ, BHN and
-BHE, all resampled to 20 Hz. The mix is deliberate: real projects are not
-uniform. (The previous, undocumented event this replaces is kept verbatim
+broadband networks, resampled to 20 Hz and prepared as AIMBAT expects
+them: rotated where a phase is measured on a rotated component, with
+every pick of a site on every channel. One event has BHZ only, four have
+BHZ and BHT, and one has BHZ, BHL, BHQ and BHT. The mix is deliberate:
+real projects are not uniform. (The previous, undocumented event this replaces is kept verbatim
 on the `aimbat_v1` branch.)
 
 ## Events
@@ -69,11 +71,11 @@ AIMBAT's manual QC step than one with a few genuinely awkward examples.
   picks are the predictions, so alignment needs a window that reaches the
   later pulse.
 
-- **Orientation that is not 0/90, and that changes between events.**
-  `AK.CCB`'s BHN and BHE point 6 deg and 96 deg at every event. `AK.GRNC`'s
-  point 16 deg and 106 deg at `solomon_islands` (April 2014) and 0 deg and
-  90 deg from `central_peru` (August 2014) onwards: one stream whose
-  orientation depends on the event.
+- **Horizontals not at 0/90, and changing between events.** `AK.CCB`'s
+  BHN and BHE point 6 deg and 96 deg at every event. `AK.GRNC`'s point
+  16 deg and 106 deg at `solomon_islands` (April 2014) and 0 deg and
+  90 deg from `central_peru` (August 2014) onwards. The rotation uses each
+  channel's own orientation, so the rotated channels are not affected.
 
 ## Station selection
 
@@ -164,12 +166,29 @@ resampled to 20 Hz (`DELTA`), down from 40 Hz (`TA`) or 50 Hz (`AK`,
 Fourier method, which cuts the spectrum hard; the low-pass keeps it from
 ringing.
 
-## Orientation
+## Orientation and rotation
 
-Each channel's azimuth and dip come from its StationXML epoch at the time
-of the event (the one fetched for the response) and are written through
-pysmo's `SAC.orientation` (`cmpaz`, `cmpinc`). Every channel here has
-them; a channel whose StationXML had none would be written without them.
+BHZ, BHN and BHE are fetched for every site of the five three-component
+events. Each channel's azimuth and dip come from its StationXML epoch at
+the time of the event (the one fetched for the response). BHN and BHE are
+then rotated with pysmo's `pysmo.tools.components`, from their own
+orientations, and not written:
+
+- **S events** (`fiji_region`, `nepal`, `iraq`, `solomon_islands`): BHT
+  from `rotate_to_rt` with the back azimuth from the station to the event.
+  T lies flat at the back azimuth + 270 deg.
+- **SKS event** (`central_peru`): BHL, BHQ and BHT from `rotate_to_lqt`
+  with the back azimuth and the incidence angle of SKS at the site, from
+  ObsPy's TauP (iasp91, the angle at the receiver, not corrected for the
+  free surface), recorded per site in `manifest.csv` (`incidence_deg`).
+  L and Q lie in the vertical plane through the ray at the back azimuth
+  + 180 deg, with dips `incidence - 90` and `incidence`. pysmo's solver
+  gives travel times only, so the angle comes from ObsPy until it gives
+  incidence angles too.
+
+A rotated file is a copy of the site's BHZ with the rotated data, its
+channel code and its orientation, written through pysmo's
+`SAC.orientation` (`cmpaz`, `cmpinc`). No R, N or E is shipped.
 
 ## Metadata annotation
 
@@ -181,34 +200,33 @@ which exists there to avoid round-tripping through the code under test —
 not a concern here). `iztype` is left at its default (`unkn`).
 
 Each file also gets labelled initial picks, the predicted arrivals of its
-event's phases, on the channels each phase is picked on:
+event's phases. Every channel of a site carries all of them, as prepared
+data commonly do. The phase's channel pattern in AIMBAT (`aimbat phase
+pattern`) then chooses the channel it is measured on:
 
-| Phase | Header | Label | Channels | Events |
+| Phase | Header | Label | Measured on | Events |
 |---|---|---|---|---|
 | P | `t0` | `kt0 = "P"` | BHZ | all but `central_peru` |
 | pP | `t5` | `kt5 = "pP"` | BHZ | `fiji_region` |
-| S | `t6` | `kt6 = "S"` | BHN, BHE | `fiji_region`, `nepal`, `iraq`, `solomon_islands` |
-| SKS | `t7` | `kt7 = "SKS"` | BHN, BHE | `central_peru` |
+| S | `t6` | `kt6 = "S"` | BHT | `fiji_region`, `nepal`, `iraq`, `solomon_islands` |
+| SKS | `t7` | `kt7 = "SKS"` | BHQ | `central_peru` |
 
-S and SKS are measured on the transverse and radial components, which
-need rotation. Their picks are on both horizontals as the station's
-arrival times, for the rotated components to take over. In AIMBAT before
-rotation, `aimbat data add --phase P --phase pP` stores them without
-promoting them. ScS, PP, Pdif and PKIKP were checked on record sections
-and left out: none was clear enough at these distances.
+ScS, PP, Pdif and PKIKP were checked on record sections and left out:
+none was clear enough at these distances.
 
 P and S come from pysmo's tau-p solver (`travel_times`). pP and SKS come
 from ObsPy's TauP, since pysmo's solver does not cover depth or core
 phases. `traveltime_backends.py` names the travel-time backend for each
 phase. At 434 km depth, Fiji's pP arrives 94 to 99 s after P. `t5` to
 `t7` are clear of the `t1` to `t3` that AIMBAT v1 writes.
-`tests/test_dataset_integrity.py` checks the labels and channels, and that
+`tests/test_dataset_integrity.py` checks the labels and channels, the
+orientation of every channel, that Q is `-Z sin(i) + R cos(i)`, and that
 each pick still agrees with its backend within 100 ms (the pP and SKS
 checks only with ObsPy installed).
 
 Each event directory also has a `manifest.csv` (network, station,
 location, channel, latitude, longitude, distance_deg, azimuth_deg,
-samples, o, idep), one row per file.
+samples, o, idep, incidence_deg), one row per file.
 
 ## SAC version 7
 
@@ -224,7 +242,8 @@ uv sync --group fetch
 uv run --group fetch python fetch_events.py
 ```
 
-The `fetch` dependency group brings ObsPy, needed for pP and SKS.
+The `fetch` dependency group brings ObsPy, needed for pP and SKS and for
+the SKS incidence angle.
 
 `pyproject.toml` pins `pysmo` to a specific commit via `[tool.uv.sources]`
 (`git = "https://github.com/pysmo/pysmo", rev = "<sha>"`), since

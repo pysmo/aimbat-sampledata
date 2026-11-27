@@ -49,6 +49,29 @@ def obspy_taup(
     return times
 
 
+def incidence_angle(*, depth: float, distance: float, phase: str) -> float:
+    """Incidence angle of a phase's first arrival, in degrees from the vertical.
+
+    The angle at the receiver in the model, from ObsPy's TauP: the true
+    incidence, not the apparent one at the free surface. Needs the `fetch`
+    dependency group. pysmo's solver gives travel times only.
+
+    Raises:
+        ValueError: If there is no arrival of `phase`.
+    """
+    from obspy.taup import TauPyModel
+
+    arrivals = TauPyModel(model=MODEL).get_travel_times(
+        source_depth_in_km=depth / 1000.0,
+        distance_in_degree=distance,
+        phase_list=[phase],
+    )
+    for arrival in arrivals:
+        if arrival.name == phase:
+            return float(arrival.incident_angle)
+    raise ValueError(f"no {phase} arrival at {distance:.2f} deg")
+
+
 PHASE_BACKENDS: dict[str, TravelTimeBackend] = {
     "P": pysmo_builtin,
     "pP": obspy_taup,
